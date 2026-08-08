@@ -229,4 +229,84 @@ class EventControllerTest {
                 .andExpect(jsonPath("$.chainLength").isNumber())
                 .andExpect(jsonPath("$.records[0].resourceId").value("doc-export-1"));
     }
+
+    // ---- Regulatory account-access audit ----
+
+    private void ingestAccountEvent(String eventType, String actorId, String resourceId) throws Exception {
+        String json = objectMapper.writeValueAsString(Map.of(
+                "eventType", eventType,
+                "actorId", actorId,
+                "resourceType", "ACCOUNT",
+                "resourceId", resourceId,
+                "payload", Map.of("field", "value")
+        ));
+        mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(json))
+                .andExpect(status().isCreated());
+    }
+
+    @Test
+    void accountAccessAuditRequiresResourceIdOrActorId() throws Exception {
+        mockMvc.perform(get("/events/account-access-audit"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void accountAccessAuditReturnsOnlyAccountResourceTypeEventsForTheGivenAccount() throws Exception {
+        ingestAccountEvent("ACCOUNT_VIEWED", "compliance-officer-1", "acct-audit-1");
+        ingestAccountEvent("ACCOUNT_BALANCE_UPDATED", "teller-2", "acct-audit-1");
+        // Different account, and a non-account resourceType — neither should appear.
+        ingestAccountEvent("ACCOUNT_VIEWED", "compliance-officer-1", "acct-audit-OTHER");
+        mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON)
+                .content(objectMapper.writeValueAsString(Map.of(
+                        "eventType", "DOC_VIEWED",
+                        "actorId", "compliance-officer-1",
+                        "resourceType", "DOCUMENT",
+                        "resourceId", "acct-audit-1",
+                        "payload", Map.of()
+                ))));
+
+        mockMvc.perform(get("/events/account-access-audit").param("resourceId", "acct-audit-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(2))
+                .andExpect(jsonPath("$.content", everyItem(hasEntry("resourceType", "ACCOUNT"))))
+                .andExpect(jsonPath("$.content", everyItem(hasEntry("resourceId", "acct-audit-1"))));
+    }
+
+    @Test
+    void accountAccessAuditCapturesBothReadsAndWrites() throws Exception {
+        ingestAccountEvent("ACCOUNT_VIEWED", "auditor", "acct-rw-1");
+        ingestAccountEvent("ACCOUNT_BALANCE_UPDATED", "auditor", "acct-rw-1");
+
+        mockMvc.perform(get("/events/account-access-audit").param("resourceId", "acct-rw-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(2))
+                .andExpect(jsonPath("$.content[*].eventType",
+                        containsInAnyOrder("ACCOUNT_VIEWED", "ACCOUNT_BALANCE_UPDATED")));
+    }
+
+    @Test
+    void accountAccessAuditFiltersByActorAcrossAccounts() throws Exception {
+        ingestAccountEvent("ACCOUNT_VIEWED", "shared-actor", "acct-a");
+        ingestAccountEvent("ACCOUNT_VIEWED", "shared-actor", "acct-b");
+        ingestAccountEvent("ACCOUNT_VIEWED", "someone-else", "acct-a");
+
+        mockMvc.perform(get("/events/account-access-audit").param("actorId", "shared-actor"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.totalElements").value(2))
+                .andExpect(jsonPath("$.content", everyItem(hasEntry("actorId", "shared-actor"))));
+    }
+
+    @Test
+    void accountAccessAuditCannotBeUsedToBypassResourceTypeScoping() throws Exception {
+        // resourceType is not an accepted parameter on this endpoint — Spring silently
+        // ignores unknown query params, so this simply confirms the endpoint still applies
+        // its own hardcoded ACCOUNT scoping regardless of what else is on the query string.
+        ingestAccountEvent("ACCOUNT_VIEWED", "actor-x", "acct-scope-test");
+
+        mockMvc.perform(get("/events/account-access-audit")
+                        .param("resourceId", "acct-scope-test")
+                        .param("resourceType", "DOCUMENT"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.content", everyItem(hasEntry("resourceType", "ACCOUNT"))));
+    }
 }

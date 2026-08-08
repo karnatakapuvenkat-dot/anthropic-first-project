@@ -196,3 +196,131 @@ the exporter at all.
 | `POST /events/{sequence}/redact` | Clear one payload field's value, preserving its hash commitment |
 | `POST /events/retention/apply` | Archive records older than a given retention window |
 | `GET /events/export?resourceId=&actorId=` | Export a self-contained, independently verifiable bundle |
+| `GET /events/account-access-audit?resourceId=&actorId=` | Regulatory audit trail for client account data (see below) |
+
+---
+
+# Regulatory access audit
+
+Product's raw ask: **"Regulators need to be able to audit access to client account data."**
+Every load-bearing word in that sentence is underspecified. Below is the requirement as
+clarified before any code was written, the ambiguities that clarification resolved, the
+resulting design, and what was deliberately left out.
+
+## Ambiguities identified and resolutions
+
+The raw requirement doesn't say what "access" includes, what "client account data" is
+scoped to, who actually calls the capability, or what "audit" needs to prove. I treated
+each as a real fork rather than picking a silent default:
+
+1. **Does "access" mean reads only, or reads and writes?** "Audit access" colloquially
+   suggests "who looked at this," but the regulatory concerns this kind of requirement
+   usually protects against (unauthorized viewing *and* unauthorized modification of client
+   funds/data) cover both. **Resolved: both reads and writes are in scope** — the audit
+   trail doesn't distinguish access-to-view from access-to-modify at the endpoint level;
+   `eventType` (already free-text, e.g. `ACCOUNT_VIEWED` vs. `ACCOUNT_BALANCE_UPDATED`)
+   carries that distinction for whoever reads the log.
+
+2. **Does a regulator call an API directly, or does someone act as an intermediary?**
+   This service has no authentication or authorization layer today — no login, no roles,
+   no session model. Standing up regulator-specific identity and access control is a
+   substantially larger project than "add an audit capability," and nothing in the ask
+   implies it's in scope. **Resolved: this is a compliance-officer-mediated capability** —
+   a person with existing access to this system queries it and produces evidence (a report
+   or an exported bundle) to hand to a regulator. Direct regulator login is out of scope,
+   documented explicitly below rather than silently assumed.
+
+3. **What counts as "client account data"?** The event schema already has a free-text
+   `resourceType` field; the existing test suite and examples use `"ACCOUNT"` for it.
+   Reaching further — e.g. correlating an account with related transactions, statements, or
+   KYC documents under one "client" — would need a client/customer identity concept this
+   system doesn't have (`resourceId` today names one resource, not a person or
+   organization). **Resolved: scoped to `resourceType == "ACCOUNT"`.** Cross-resource-type
+   correlation is named explicitly as future work, not guessed at.
+
+4. **What does "audit" need to prove?** Two very different bars: (a) a trustworthy record
+   that access happened, who did it, and when; versus (b) an assertion that every access
+   was *authorized*, which requires cross-referencing against a permissions/roles model.
+   This service has no permission model to check against. **Resolved: (a) only** — this
+   capability proves the existence and tamper-evidence of the access record; judging
+   whether a given access was authorized is left to the humans reading the log (compliance
+   officer, regulator), the same way it already works for every other event type this
+   service stores.
+
+## Clarified requirement statement
+
+> The audit log service must let a compliance officer retrieve a complete, tamper-evident
+> record of every read or write event recorded against resources of type `ACCOUNT`,
+> filterable by account (`resourceId`) and/or by actor (`actorId`), optionally bounded to a
+> time window, suitable for producing evidence to hand to a regulator. This is a read/query
+> capability layered on the existing event log — it does not grant regulators direct system
+> access, does not correlate access events against a permission model to judge whether each
+> access was authorized, and does not unify account data with other resource types under a
+> client/customer identity, since no such identity concept exists in this system today.
+
+## Design
+
+The existing `GET /events` endpoint already supports filtering by `resourceType`,
+`resourceId`, `actorId`, and a time range — the underlying capability (query events by
+account) already existed. What was missing was a **purpose-built, scoped-by-construction**
+entry point: today, nothing stops a caller from either querying too broadly (no account
+data filter enforced) or having to know and correctly supply `resourceType=ACCOUNT` by
+convention on every regulator-facing request, with no guarantee that convention is
+followed.
+
+`GET /events/account-access-audit` (`EventController`) is a thin, deliberately narrow
+wrapper:
+
+- **`resourceType` is hardcoded to `"ACCOUNT"`**, not caller-suppliable — even if a caller
+  passes `resourceType=DOCUMENT` on the query string, it's ignored (see
+  `EventControllerTest.accountAccessAuditCannotBeUsedToBypassResourceTypeScoping`). This is
+  the actual point of a separate endpoint rather than documentation telling callers to
+  remember the right query parameter.
+- **At least one of `resourceId` or `actorId` is required** (400 otherwise), so the
+  endpoint can't be used to dump the entire account population in one call — a regulator
+  audit request is, in practice, always about a specific account or a specific actor's
+  activity, never "show me everything."
+- **Reuses `EventStore.query` and `EventQuery` unchanged** — no new storage mechanism, no
+  new event schema. `eventType` is deliberately left as a normal, unfiltered field in the
+  response so a read (`ACCOUNT_VIEWED`) and a write (`ACCOUNT_BALANCE_UPDATED`) both surface
+  under the same query, satisfying the "reads and writes" resolution above without the
+  endpoint needing to know which event types are reads vs. writes.
+- **Pairs with the existing `GET /events/export`** for the actual regulator hand-off
+  artifact: `account-access-audit` is the *review* surface (a compliance officer paging
+  through results, narrowing by actor/time), while `export?resourceId=...` produces the
+  self-contained, independently verifiable bundle that's the actual evidence document —
+  no new export mechanism was built, since the existing one already does exactly what's
+  needed once the account has been identified via the audit query.
+
+## Scope: implemented vs. explicitly deferred
+
+**Implemented:**
+- `GET /events/account-access-audit` — scoped, guarded query endpoint for account-type
+  read/write events, by account and/or actor, optionally time-bounded.
+- Full test coverage: 400 on no filter, correct account-only scoping (excluding same-`resourceId`-different-`resourceType`
+  records), both-reads-and-writes inclusion, actor-based filtering across accounts, and
+  confirmation the endpoint can't be tricked into a different `resourceType` via query
+  parameter.
+
+**Explicitly scoped out, and why:**
+- **Direct regulator authentication/authorization.** This system has no auth layer at all
+  today; adding one is an orders-of-magnitude larger change than this requirement asked
+  for, and the ask itself doesn't specify an identity provider, session model, or
+  permission granularity to build against. A compliance officer with existing system access
+  is the mediating party instead.
+- **Correlating access against an authorization model** ("was this access allowed").
+  Requires a permissions/roles system that doesn't exist in this codebase. This capability
+  proves *what happened*, not *whether it should have*.
+- **Cross-resource-type correlation under a client identity** (account + transactions +
+  KYC documents, unified). Requires a client/customer identity concept this schema doesn't
+  have (`resourceId` names one resource, not a person). Noted as a natural next step if a
+  future requirement needs "everything touching client X," not guessed at now.
+- **Configurable/multi-value account resourceType.** `ACCOUNT_RESOURCE_TYPE` is a single
+  hardcoded constant, not an externalized list. Changing or extending it is a one-line
+  code change; making it configurable now would be speculative generality for a
+  requirement that has named exactly one data category.
+- **Enforcement that upstream systems actually emit account-access events.** This service
+  can only audit what's logged to it — whether the system(s) that actually serve account
+  data reliably call `POST /events` for every read and write is an integration contract
+  outside this service's boundary, not something it can verify or enforce from the audit
+  log side.

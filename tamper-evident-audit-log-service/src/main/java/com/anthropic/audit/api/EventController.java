@@ -35,6 +35,15 @@ import java.util.List;
 @RequestMapping("/events")
 public class EventController {
 
+    /**
+     * The {@code resourceType} value that designates client account data. resourceType is a
+     * free-text field set by whatever upstream system calls {@code POST /events}; this
+     * constant is the one place that decision is pinned down for the purposes of
+     * {@link #accountAccessAudit}. See DESIGN.md for why this wasn't made a configurable
+     * list — narrowed deliberately to what's actually been asked for so far.
+     */
+    private static final String ACCOUNT_RESOURCE_TYPE = "ACCOUNT";
+
     private final EventStore eventStore;
 
     public EventController(EventStore eventStore) {
@@ -69,6 +78,56 @@ public class EventController {
         }
 
         EventQuery query = new EventQuery(actorId, resourceType, resourceId, eventType, from, to);
+        EventStore.PageResult result = eventStore.query(query, page, size);
+
+        List<EventResponse> content = result.content().stream()
+                .map(EventResponse::from)
+                .toList();
+
+        return PageResponse.of(content, page, size, result.totalElements());
+    }
+
+    /**
+     * Returns every read or write event recorded against client account data
+     * ({@code resourceType == "ACCOUNT"}), for a specific account and/or actor, optionally
+     * bounded to a time window. Intended for a compliance officer building an evidence
+     * package for a regulator — see DESIGN.md ("Regulatory access audit") for the clarified
+     * requirement this satisfies and what is explicitly out of scope (no direct regulator
+     * login, no cross-resource-type correlation, no authorization judgment — only "what
+     * happened, to which account, by whom, when," backed by the chain's tamper-evidence).
+     *
+     * <p>Unlike {@link #query}, {@code resourceType} is not caller-suppliable here — it is
+     * always {@value #ACCOUNT_RESOURCE_TYPE} — and at least one of {@code resourceId} or
+     * {@code actorId} is required, so this endpoint cannot be used to dump the entire
+     * account population without a specific target. For a self-contained, independently
+     * verifiable artifact to actually hand to a regulator, pair this with
+     * {@code GET /events/export?resourceId=...}, which returns the matching records plus
+     * chain metadata a recipient can verify without live access to this system.
+     */
+    @GetMapping("/account-access-audit")
+    public PageResponse<EventResponse> accountAccessAudit(
+            @RequestParam(required = false) String resourceId,
+            @RequestParam(required = false) String actorId,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE_TIME) Instant to,
+            @RequestParam(defaultValue = "0") int page,
+            @RequestParam(defaultValue = "20") int size
+    ) {
+        if (resourceId == null && actorId == null) {
+            throw new IllegalArgumentException(
+                    "At least one of resourceId or actorId is required for an account access audit");
+        }
+        if (page < 0) {
+            throw new IllegalArgumentException("page must be >= 0");
+        }
+        if (size < 1 || size > 500) {
+            throw new IllegalArgumentException("size must be between 1 and 500");
+        }
+        if (from != null && to != null && from.isAfter(to)) {
+            throw new IllegalArgumentException("from must not be after to");
+        }
+
+        EventQuery query = new EventQuery(actorId, ACCOUNT_RESOURCE_TYPE, resourceId, null, from, to);
         EventStore.PageResult result = eventStore.query(query, page, size);
 
         List<EventResponse> content = result.content().stream()
