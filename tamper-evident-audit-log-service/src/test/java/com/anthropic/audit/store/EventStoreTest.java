@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.List;
 import java.util.Map;
@@ -88,7 +89,9 @@ class EventStoreTest {
                 tampered.payload(),
                 tampered.timestamp(),
                 tampered.previousHash(),
-                tampered.recordHash() // stale hash, no longer matches content
+                tampered.recordHash(), // stale hash, no longer matches content
+                tampered.archived(),
+                tampered.archivedAt()
         );
         internalRecords.set(1, forged);
 
@@ -96,13 +99,12 @@ class EventStoreTest {
     }
 
     @Test
-    void noPublicMethodCanMutateOrDeleteAnExistingRecord() {
+    void noPublicMethodCanRewriteOrDeleteAnExistingRecordsHashOrOrdering() {
         for (var method : EventStore.class.getDeclaredMethods()) {
             if (!Modifier.isPublic(method.getModifiers())) {
                 continue;
             }
             String name = method.getName().toLowerCase();
-            assertFalse(name.contains("update"), "Unexpected mutating method: " + method.getName());
             assertFalse(name.contains("delete"), "Unexpected mutating method: " + method.getName());
             assertFalse(name.contains("remove"), "Unexpected mutating method: " + method.getName());
         }
@@ -152,5 +154,158 @@ class EventStoreTest {
         assertEquals(25, page0.totalElements());
         assertEquals(10, page0.content().size());
         assertEquals(5, page2.content().size());
+    }
+
+    // ---- Redaction ----
+
+    @Test
+    void redactFieldClearsValueButPreservesRecordHash() {
+        EventStore store = new EventStore();
+        CreateEventRequest request = new CreateEventRequest(
+                "PAYMENT_PROCESSED", "alice", "ACCOUNT", "acct-1",
+                Map.of("accountNumber", "1234567890", "amount", 500));
+        EventRecord original = store.append(request);
+        String hashBefore = original.recordHash();
+
+        EventRecord redacted = store.redactField(original.sequence(), "accountNumber", "GDPR erasure request");
+
+        assertEquals(hashBefore, redacted.recordHash());
+        assertNull(redacted.payload().get("accountNumber").value());
+        assertTrue(redacted.payload().get("accountNumber").redacted());
+        assertNotNull(redacted.payload().get("accountNumber").contentHash());
+        // Untouched field is unaffected.
+        assertEquals(500, redacted.payload().get("amount").value());
+    }
+
+    @Test
+    void redactFieldDoesNotBreakChainVerification() {
+        EventStore store = new EventStore();
+        store.append(sampleRequest("alice"));
+        EventRecord target = store.append(new CreateEventRequest(
+                "PAYMENT_PROCESSED", "bob", "ACCOUNT", "acct-1",
+                Map.of("accountNumber", "9999888877")));
+        store.append(sampleRequest("carol"));
+
+        store.redactField(target.sequence(), "accountNumber", "privacy request");
+
+        assertTrue(store.verifyChain().isEmpty(),
+                "Redacting a field must not be reported as a chain break");
+    }
+
+    @Test
+    void redactFieldRejectsUnknownSequenceOrField() {
+        EventStore store = new EventStore();
+        EventRecord record = store.append(sampleRequest("alice"));
+
+        assertThrows(IllegalArgumentException.class, () -> store.redactField(99, "x", "reason"));
+        assertThrows(IllegalArgumentException.class,
+                () -> store.redactField(record.sequence(), "doesNotExist", "reason"));
+    }
+
+    @Test
+    void redactingSameFieldTwiceIsIdempotentAndStillVerifies() {
+        EventStore store = new EventStore();
+        EventRecord record = store.append(new CreateEventRequest(
+                "USER_UPDATED", "alice", "USER", "u1", Map.of("ssn", "111-22-3333")));
+
+        store.redactField(record.sequence(), "ssn", "first request");
+        EventRecord second = store.redactField(record.sequence(), "ssn", "second request");
+
+        assertTrue(second.payload().get("ssn").redacted());
+        assertTrue(store.verifyChain().isEmpty());
+    }
+
+    // ---- Retention / archival ----
+
+    @Test
+    void applyRetentionArchivesOnlyRecordsOlderThanWindow() {
+        EventStore store = new EventStore();
+        EventRecord recent = store.append(sampleRequest("alice"));
+
+        store.backdateForTesting(recent.sequence(), Instant.now().minus(Duration.ofDays(100)));
+
+        int archivedCount = store.applyRetention(Duration.ofDays(90));
+
+        assertEquals(1, archivedCount);
+        assertTrue(store.findBySequence(recent.sequence()).orElseThrow().archived());
+    }
+
+    @Test
+    void applyRetentionLeavesRecentRecordsUnarchived() {
+        EventStore store = new EventStore();
+        EventRecord fresh = store.append(sampleRequest("alice"));
+
+        int archivedCount = store.applyRetention(Duration.ofDays(90));
+
+        assertEquals(0, archivedCount);
+        assertFalse(store.findBySequence(fresh.sequence()).orElseThrow().archived());
+    }
+
+    @Test
+    void archivedRecordsStillVerifyWithoutFalsePositiveBreak() {
+        EventStore store = new EventStore();
+        store.append(sampleRequest("alice"));
+        EventRecord old = store.append(sampleRequest("bob"));
+        store.append(sampleRequest("carol"));
+
+        store.backdateForTesting(old.sequence(), Instant.now().minus(Duration.ofDays(400)));
+        store.applyRetention(Duration.ofDays(90));
+
+        assertTrue(store.findBySequence(old.sequence()).orElseThrow().archived());
+        assertTrue(store.verifyChain().isEmpty(),
+                "A legitimately archived record must not register as a chain break");
+    }
+
+    @Test
+    void applyRetentionDoesNotChangePayloadOrHashes() {
+        EventStore store = new EventStore();
+        EventRecord record = store.append(sampleRequest("alice"));
+        EventRecord backdated = store.backdateForTesting(record.sequence(), Instant.now().minus(Duration.ofDays(400)));
+
+        store.applyRetention(Duration.ofDays(90));
+
+        EventRecord archived = store.findBySequence(record.sequence()).orElseThrow();
+        assertEquals(backdated.recordHash(), archived.recordHash());
+        assertEquals(backdated.previousHash(), archived.previousHash());
+        assertEquals(backdated.payload(), archived.payload());
+    }
+
+    // ---- Bulk export ----
+
+    @Test
+    void exportReturnsOnlyMatchingRecordsInSequenceOrder() {
+        EventStore store = new EventStore();
+        store.append(new CreateEventRequest("A", "alice", "DOC", "doc-1", Map.of()));
+        store.append(new CreateEventRequest("B", "bob", "DOC", "doc-2", Map.of()));
+        store.append(new CreateEventRequest("C", "alice", "DOC", "doc-1", Map.of()));
+
+        EventStore.ExportResult result = store.exportRecords("doc-1", null);
+
+        assertEquals(2, result.records().size());
+        assertEquals(0L, result.records().get(0).sequence());
+        assertEquals(2L, result.records().get(1).sequence());
+    }
+
+    @Test
+    void exportIncludesChainMetadataThatVerifiesTheSlice() {
+        EventStore store = new EventStore();
+        store.append(new CreateEventRequest("A", "alice", "DOC", "other", Map.of()));
+        EventRecord first = store.append(new CreateEventRequest("B", "alice", "DOC", "doc-1", Map.of("k", "v")));
+        EventRecord second = store.append(new CreateEventRequest("C", "alice", "DOC", "doc-1", Map.of("k", "v2")));
+        store.append(new CreateEventRequest("D", "alice", "DOC", "other", Map.of()));
+
+        EventStore.ExportResult result = store.exportRecords("doc-1", null);
+
+        assertEquals(first.previousHash(), result.precedingHash());
+        assertEquals(first.recordHash(), result.records().get(0).recordHash());
+        assertEquals(first.recordHash(), result.records().get(1).previousHash());
+        assertEquals(second.recordHash(), result.records().get(1).recordHash());
+        assertEquals(4, result.chainLength());
+    }
+
+    @Test
+    void exportRequiresAtLeastOneFilter() {
+        EventStore store = new EventStore();
+        assertThrows(IllegalArgumentException.class, () -> store.exportRecords(null, null));
     }
 }

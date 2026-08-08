@@ -129,4 +129,104 @@ class EventControllerTest {
                         .content("{}"))
                 .andExpect(status().is4xxClientError());
     }
+
+    @Test
+    void verifyReportsIntactChain() throws Exception {
+        mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON)
+                .content(validEventJson("verify-actor", "USER_LOGIN")));
+
+        mockMvc.perform(get("/events/verify"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.intact").value(true))
+                .andExpect(jsonPath("$.firstBrokenSequence").doesNotExist());
+    }
+
+    @Test
+    void redactClearsFieldValueAndChainRemainsIntact() throws Exception {
+        String json = objectMapper.writeValueAsString(Map.of(
+                "eventType", "PAYMENT_PROCESSED",
+                "actorId", "redact-actor",
+                "resourceType", "ACCOUNT",
+                "resourceId", "acct-redact",
+                "payload", Map.of("accountNumber", "1234567890")
+        ));
+
+        String response = mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(json))
+                .andExpect(status().isCreated())
+                .andReturn().getResponse().getContentAsString();
+        long sequence = objectMapper.readTree(response).get("sequence").asLong();
+
+        String redactRequest = objectMapper.writeValueAsString(Map.of(
+                "field", "accountNumber",
+                "reason", "privacy request"
+        ));
+
+        mockMvc.perform(post("/events/" + sequence + "/redact")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(redactRequest))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.payload.accountNumber.value").doesNotExist())
+                .andExpect(jsonPath("$.payload.accountNumber.redacted").value(true))
+                .andExpect(jsonPath("$.payload.accountNumber.contentHash").isString());
+
+        mockMvc.perform(get("/events/verify"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.intact").value(true));
+    }
+
+    @Test
+    void redactUnknownFieldReturnsBadRequest() throws Exception {
+        String response = mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON)
+                        .content(validEventJson("someone", "USER_LOGIN")))
+                .andReturn().getResponse().getContentAsString();
+        long sequence = objectMapper.readTree(response).get("sequence").asLong();
+
+        String redactRequest = objectMapper.writeValueAsString(Map.of(
+                "field", "doesNotExist",
+                "reason", "privacy request"
+        ));
+
+        mockMvc.perform(post("/events/" + sequence + "/redact")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content(redactRequest))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void retentionApplyArchivesNothingWhenAllRecordsAreRecent() throws Exception {
+        mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON)
+                .content(validEventJson("retention-actor", "USER_LOGIN")));
+
+        mockMvc.perform(post("/events/retention/apply")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"retentionWindow\":\"P90D\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.archivedCount").value(0));
+    }
+
+    @Test
+    void exportRequiresAFilter() throws Exception {
+        mockMvc.perform(get("/events/export"))
+                .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    void exportReturnsSelfContainedVerifiableBundle() throws Exception {
+        String json = objectMapper.writeValueAsString(Map.of(
+                "eventType", "DOC_VIEWED",
+                "actorId", "export-actor",
+                "resourceType", "DOCUMENT",
+                "resourceId", "doc-export-1",
+                "payload", Map.of("k", "v")
+        ));
+        mockMvc.perform(post("/events").contentType(MediaType.APPLICATION_JSON).content(json));
+
+        mockMvc.perform(get("/events/export").param("resourceId", "doc-export-1"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.records", not(empty())))
+                .andExpect(jsonPath("$.precedingHash").isString())
+                .andExpect(jsonPath("$.chainHeadHash").isString())
+                .andExpect(jsonPath("$.chainLength").isNumber())
+                .andExpect(jsonPath("$.records[0].resourceId").value("doc-export-1"));
+    }
 }

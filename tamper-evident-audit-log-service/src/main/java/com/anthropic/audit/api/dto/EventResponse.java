@@ -4,6 +4,7 @@ import com.anthropic.audit.model.EventRecord;
 
 import java.time.Instant;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 public record EventResponse(
         long sequence,
@@ -11,10 +12,12 @@ public record EventResponse(
         String actorId,
         String resourceType,
         String resourceId,
-        Map<String, Object> payload,
+        Map<String, PayloadFieldResponse> payload,
         Instant timestamp,
         String previousHash,
-        String recordHash
+        String recordHash,
+        boolean archived,
+        Instant archivedAt
 ) {
     public static EventResponse from(EventRecord record) {
         return new EventResponse(
@@ -23,10 +26,13 @@ public record EventResponse(
                 record.actorId(),
                 record.resourceType(),
                 record.resourceId(),
-                record.payload(),
+                record.payload().entrySet().stream()
+                        .collect(Collectors.toMap(Map.Entry::getKey, e -> PayloadFieldResponse.from(e.getValue()))),
                 record.timestamp(),
                 record.previousHash(),
-                record.recordHash()
+                record.recordHash(),
+                record.archived(),
+                record.archivedAt()
         );
     }
 }
